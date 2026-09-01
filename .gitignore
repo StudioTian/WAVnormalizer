@@ -1,8 +1,9 @@
-.venv/
-.uv-cache/
 __pycache__/
-.pytest_cache/
 *.py[cod]
-*_enhanced.wav
 build/
-*.spec
+dist/
+*.exe
+*.wav
+*.mp3
+.DS_Store
+Thumbs.db

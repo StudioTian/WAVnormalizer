@@ -2,3 +2,5 @@ numpy>=1.24
 pedalboard>=0.9.16
 scipy>=1.10
 soundfile>=0.12
+imageio-ffmpeg>=0.6,<1
+pyinstaller>=6.22,<7
