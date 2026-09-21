@@ -29,7 +29,14 @@ pip install -r requirements.txt
 
 ### 2. 執行處理
 ```bash
-python WAVnormalizer.py "路徑/至/音訊.wav" "路徑/至/資料夾"
+# 預設維持與輸入檔案相同格式（如 .m4a 預設以 24-bit ALAC 無損封裝，避免二次壓縮損失音質）
+python WAVnormalizer.py "路徑/至/音訊.m4a" "路徑/至/資料夾"
+
+# 強制輸出為 24-bit WAV 格式
+python WAVnormalizer.py "路徑/至/音訊.m4a" --format wav
+
+# 輸出為 M4A 格式並指定為 AAC 320k 高音質有損壓縮
+python WAVnormalizer.py "路徑/至/音訊.m4a" --format m4a --m4a-codec aac
 ```
 
 ## 📄 授權 / License

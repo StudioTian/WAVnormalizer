@@ -91,7 +91,7 @@ def _load_with_pedalboard(path: Path) -> Tuple[np.ndarray, int]:
 def load_audio(path: Path, ffmpeg_path: Optional[Path] = None) -> Tuple[np.ndarray, int]:
     try:
         return _load_with_pedalboard(path)
-    except (OSError, RuntimeError) as original_error:
+    except (ValueError, OSError, RuntimeError) as original_error:
         if ffmpeg_path is None:
             raise original_error
 
@@ -475,6 +475,16 @@ def find_ffmpeg(explicit_path: Optional[str] = None) -> Path:
     resolved = _resolve_executable("ffmpeg")
     if resolved:
         return resolved
+
+    try:
+        import imageio_ffmpeg
+
+        imageio_bin = _resolve_executable(imageio_ffmpeg.get_ffmpeg_exe())
+        if imageio_bin:
+            return imageio_bin
+    except Exception:
+        pass
+
     raise FileNotFoundError(
         "找不到 ffmpeg。請安裝 ffmpeg、放到 PATH，或使用 --ffmpeg 指定執行檔。"
     )
@@ -514,6 +524,48 @@ def _extract_loudnorm_measurements(stderr: str) -> Dict[str, str]:
     return {key: str(data[key]) for key in required}
 
 
+def _audio_codec_args_for_output(output_path: Path, m4a_codec: str = "alac") -> List[str]:
+    suffix = output_path.suffix.lower()
+    if suffix == ".m4a":
+        if m4a_codec == "aac":
+            return ["-c:a", "aac", "-b:a", "320k"]
+        return ["-c:a", "alac", "-sample_fmt", "s32p"]
+    elif suffix == ".aac":
+        return ["-c:a", "aac", "-b:a", "320k"]
+    elif suffix == ".mp3":
+        return ["-c:a", "libmp3lame", "-b:a", "320k"]
+    elif suffix == ".flac":
+        return ["-c:a", "flac"]
+    elif suffix in (".aif", ".aiff"):
+        return ["-c:a", "pcm_s24be"]
+    elif suffix == ".ogg":
+        return ["-c:a", "libvorbis", "-q:a", "8"]
+    elif suffix == ".opus":
+        return ["-c:a", "libopus", "-b:a", "192k"]
+    return ["-c:a", "pcm_s24le"]
+
+
+def _format_description(path: Path, m4a_codec: str = "alac") -> str:
+    suffix = path.suffix.lower()
+    if suffix == ".m4a":
+        if m4a_codec == "aac":
+            return "AAC 320k M4A"
+        return "24-bit ALAC Lossless M4A"
+    elif suffix == ".aac":
+        return "AAC 320k"
+    elif suffix == ".mp3":
+        return "MP3 320k"
+    elif suffix == ".flac":
+        return "24-bit FLAC"
+    elif suffix in (".aif", ".aiff"):
+        return "24-bit AIFF"
+    elif suffix == ".ogg":
+        return "Ogg Vorbis"
+    elif suffix == ".opus":
+        return "Opus"
+    return "24-bit WAV"
+
+
 def normalize_loudness(
     input_path: Path,
     output_path: Path,
@@ -522,6 +574,7 @@ def normalize_loudness(
     target_lufs: float = -14.0,
     true_peak_db: float = -1.0,
     loudness_range: float = 11.0,
+    m4a_codec: str = "alac",
 ) -> None:
     common_filter = f"I={target_lufs}:TP={true_peak_db}:LRA={loudness_range}"
     first_pass = _run_ffmpeg(
@@ -548,6 +601,7 @@ def normalize_loudness(
         f":offset={measured['target_offset']}"
         ":linear=true:print_format=summary"
     )
+    codec_args = _audio_codec_args_for_output(output_path, m4a_codec=m4a_codec)
     _run_ffmpeg(
         [
             str(ffmpeg_path),
@@ -565,8 +619,7 @@ def normalize_loudness(
             second_filter,
             "-ar",
             str(sample_rate),
-            "-c:a",
-            "pcm_s24le",
+            *codec_args,
             str(output_path),
         ]
     )
@@ -591,9 +644,26 @@ def process_file(
     seed: int = 42,
     target_lufs: float = -14.0,
     true_peak_db: float = -1.0,
+    output_format: str = "same",
+    m4a_codec: str = "alac",
 ) -> ProcessResult:
     input_path = input_path.resolve()
-    output_path = (output_path or input_path.with_name(input_path.stem + OUTPUT_SUFFIX + ".wav")).resolve()
+    if output_path is None:
+        if output_format == "same":
+            target_suffix = input_path.suffix.lower()
+        elif output_format == "m4a":
+            target_suffix = ".m4a"
+        elif output_format == "wav":
+            target_suffix = ".wav"
+        elif output_format == "flac":
+            target_suffix = ".flac"
+        elif output_format.startswith("."):
+            target_suffix = output_format.lower()
+        else:
+            target_suffix = f".{output_format.lower()}"
+        output_path = (input_path.with_name(input_path.stem + OUTPUT_SUFFIX + target_suffix)).resolve()
+    else:
+        output_path = output_path.resolve()
     print(f"\n[處理] {input_path.name}")
     audio, sample_rate = load_audio(input_path, ffmpeg_path)
     print(f"  格式：{sample_rate} Hz / {audio.shape[0]} 聲道")
@@ -629,7 +699,7 @@ def process_file(
         sf.write(str(temporary_input), audio.T, sample_rate, subtype="FLOAT")
 
         with tempfile.NamedTemporaryFile(
-            prefix=f".{output_path.stem}_", suffix=".wav", dir=str(output_path.parent), delete=False
+            prefix=f".{output_path.stem}_", suffix=output_path.suffix, dir=str(output_path.parent), delete=False
         ) as handle:
             temporary_output = Path(handle.name)
         temporary_output.unlink(missing_ok=True)
@@ -641,6 +711,7 @@ def process_file(
             sample_rate,
             target_lufs,
             true_peak_db,
+            m4a_codec=m4a_codec,
         )
         os.replace(temporary_output, output_path)
         temporary_output = None
@@ -650,7 +721,8 @@ def process_file(
         if temporary_output is not None:
             temporary_output.unlink(missing_ok=True)
 
-    print(f"  [完成] {output_path.name}（{target_lufs:g} LUFS / {true_peak_db:g} dBTP / 24-bit WAV）")
+    format_desc = _format_description(output_path, m4a_codec=m4a_codec)
+    print(f"  [完成] {output_path.name}（{target_lufs:g} LUFS / {true_peak_db:g} dBTP / {format_desc}）")
     return ProcessResult(input_path, output_path, report, widened, False)
 
 
@@ -715,6 +787,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=42, help="相位網路的可重現亂數種子。")
     parser.add_argument("--target-lufs", type=float, default=-14.0, help="目標整體響度。")
     parser.add_argument("--true-peak", type=float, default=-1.0, help="True Peak 上限 dBTP。")
+    parser.add_argument(
+        "--output-format",
+        "--format",
+        dest="output_format",
+        choices=("same", "wav", "m4a", "flac"),
+        default="same",
+        help="輸出音訊格式：same（預設，與輸入檔案格式相同且盡可能無損）、wav（24-bit WAV）、m4a（24-bit ALAC 無損 M4A）、flac（無損 FLAC）。",
+    )
+    parser.add_argument(
+        "--m4a-codec",
+        choices=("alac", "aac"),
+        default="alac",
+        help="M4A 輸出編碼：alac（預設，Apple Lossless 24-bit 無損，避免二次壓縮音質受損）或 aac（AAC 320k 高音質有損壓縮）。",
+    )
     return parser
 
 
@@ -766,6 +852,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 seed=args.seed,
                 target_lufs=args.target_lufs,
                 true_peak_db=args.true_peak,
+                output_format=args.output_format,
+                m4a_codec=args.m4a_codec,
             )
             skipped += int(result.skipped)
         except (OSError, RuntimeError, ValueError, subprocess.CalledProcessError) as error:
