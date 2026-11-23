@@ -29,6 +29,8 @@ jobs:
       - name: Run tests
         run: python -m pytest -q
       - name: Build executable
+        env:
+          PYTHONUTF8: '1'
         run: python build_exe.py
       - name: Smoke-test executable
         timeout-minutes: 5
