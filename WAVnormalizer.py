@@ -1,21 +1,19 @@
 from __future__ import annotations
 
-import argparse
-import json
 import math
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import soundfile as sf
-from pedalboard import Compressor, Pedalboard
 from pedalboard.io import AudioFile
 from scipy import signal
 
@@ -33,6 +31,8 @@ SUPPORTED_EXTENSIONS = {
     ".wma",
 }
 OUTPUT_SUFFIX = "_enhanced"
+TARGET_LUFS = -14.0
+TRUE_PEAK_DB = -1.0
 EPSILON = 1.0e-12
 
 
@@ -396,32 +396,11 @@ def widen_mono(
     right = mono - side
     stereo = np.stack((left, right)).astype(np.float32)
 
-    # Keep a safe floating-point headroom before compression. The same scale is
-    # applied to Mid and Side, so mono compatibility remains exact.
+    # Scale Mid and Side together to preserve their balance when folded to mono.
     peak = float(np.max(np.abs(stereo)))
     if peak > 0.98:
         stereo *= 0.98 / peak
     return stereo
-
-
-def apply_opto_compression(
-    audio: np.ndarray,
-    sample_rate: int,
-    threshold_db: float = -18.0,
-    ratio: float = 3.5,
-    attack_ms: float = 10.0,
-    release_ms: float = 650.0,
-) -> np.ndarray:
-    audio = _as_channel_first(audio)
-    compressor = Compressor(
-        threshold_db=threshold_db,
-        ratio=ratio,
-        attack_ms=attack_ms,
-        release_ms=release_ms,
-    )
-    board = Pedalboard([compressor])
-    result = board(audio, sample_rate, reset=True)
-    return _as_channel_first(result)
 
 
 def _resolve_executable(candidate: str) -> Optional[Path]:
@@ -432,14 +411,8 @@ def _resolve_executable(candidate: str) -> Optional[Path]:
     return Path(resolved).resolve() if resolved else None
 
 
-def find_ffmpeg(explicit_path: Optional[str] = None) -> Path:
+def find_ffmpeg() -> Path:
     executable_name = "ffmpeg.exe" if os.name == "nt" else "ffmpeg"
-    if explicit_path:
-        resolved = _resolve_executable(explicit_path)
-        if resolved:
-            return resolved
-        raise FileNotFoundError(f"找不到指定的 ffmpeg：{explicit_path}")
-
     environment_path = os.environ.get("FFMPEG_BINARY")
     if environment_path:
         resolved = _resolve_executable(environment_path)
@@ -485,9 +458,7 @@ def find_ffmpeg(explicit_path: Optional[str] = None) -> Path:
     except Exception:
         pass
 
-    raise FileNotFoundError(
-        "找不到 ffmpeg。請安裝 ffmpeg、放到 PATH，或使用 --ffmpeg 指定執行檔。"
-    )
+    raise FileNotFoundError("找不到處理音檔所需的 FFmpeg。請確認程式檔案是否完整。")
 
 
 def _subprocess_startupinfo() -> Optional[subprocess.STARTUPINFO]:
@@ -510,25 +481,25 @@ def _run_ffmpeg(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
     )
 
 
-def _extract_loudnorm_measurements(stderr: str) -> Dict[str, str]:
-    matches = re.findall(r"\{\s*\"input_i\".*?\}", stderr, flags=re.DOTALL)
-    if not matches:
-        raise ValueError("ffmpeg 未回傳 loudnorm 測量資料。")
-    data = json.loads(matches[-1])
-    required = ("input_i", "input_tp", "input_lra", "input_thresh", "target_offset")
-    if any(key not in data for key in required):
-        raise ValueError("ffmpeg loudnorm 測量資料不完整。")
-    for key in required:
-        if not math.isfinite(float(data[key])):
-            raise ValueError(f"ffmpeg loudnorm 測量值無效：{key}={data[key]}")
-    return {key: str(data[key]) for key in required}
+def _parse_ebur128_summary(stderr: str) -> Tuple[float, float]:
+    _, heading, summary = stderr.rpartition("Summary:")
+    measurements = re.search(
+        r"Integrated loudness:\s*I:\s*(\S+)\s+LUFS\b.*?"
+        r"True peak:\s*Peak:\s*(\S+)\s+dBFS\b",
+        summary,
+        flags=re.DOTALL,
+    )
+    if not heading or measurements is None:
+        raise ValueError("無法讀取音量與真峰值量測結果。")
+    integrated_lufs, peak_db = map(float, measurements.groups())
+    if not math.isfinite(integrated_lufs) or integrated_lufs <= -70.0 or not math.isfinite(peak_db):
+        raise ValueError("音檔是靜音，或聲音太短或太小，無法測量音量。")
+    return integrated_lufs, peak_db
 
 
-def _audio_codec_args_for_output(output_path: Path, m4a_codec: str = "alac") -> List[str]:
+def _audio_codec_args_for_output(output_path: Path) -> List[str]:
     suffix = output_path.suffix.lower()
     if suffix == ".m4a":
-        if m4a_codec == "aac":
-            return ["-c:a", "aac", "-b:a", "320k"]
         return ["-c:a", "alac", "-sample_fmt", "s32p"]
     elif suffix == ".aac":
         return ["-c:a", "aac", "-b:a", "320k"]
@@ -542,42 +513,13 @@ def _audio_codec_args_for_output(output_path: Path, m4a_codec: str = "alac") -> 
         return ["-c:a", "libvorbis", "-q:a", "8"]
     elif suffix == ".opus":
         return ["-c:a", "libopus", "-b:a", "192k"]
+    elif suffix == ".wma":
+        return ["-c:a", "wmav2", "-b:a", "192k"]
     return ["-c:a", "pcm_s24le"]
 
 
-def _format_description(path: Path, m4a_codec: str = "alac") -> str:
-    suffix = path.suffix.lower()
-    if suffix == ".m4a":
-        if m4a_codec == "aac":
-            return "AAC 320k M4A"
-        return "24-bit ALAC Lossless M4A"
-    elif suffix == ".aac":
-        return "AAC 320k"
-    elif suffix == ".mp3":
-        return "MP3 320k"
-    elif suffix == ".flac":
-        return "24-bit FLAC"
-    elif suffix in (".aif", ".aiff"):
-        return "24-bit AIFF"
-    elif suffix == ".ogg":
-        return "Ogg Vorbis"
-    elif suffix == ".opus":
-        return "Opus"
-    return "24-bit WAV"
-
-
-def normalize_loudness(
-    input_path: Path,
-    output_path: Path,
-    ffmpeg_path: Path,
-    sample_rate: int,
-    target_lufs: float = -14.0,
-    true_peak_db: float = -1.0,
-    loudness_range: float = 11.0,
-    m4a_codec: str = "alac",
-) -> None:
-    common_filter = f"I={target_lufs}:TP={true_peak_db}:LRA={loudness_range}"
-    first_pass = _run_ffmpeg(
+def _measure_loudness(input_path: Path, ffmpeg_path: Path) -> Tuple[float, float]:
+    result = _run_ffmpeg(
         [
             str(ffmpeg_path),
             "-hide_banner",
@@ -585,23 +527,22 @@ def normalize_loudness(
             "-i",
             str(input_path),
             "-af",
-            f"loudnorm={common_filter}:print_format=json",
+            "ebur128=peak=true:framelog=quiet",
             "-f",
             "null",
             os.devnull,
         ]
     )
-    measured = _extract_loudnorm_measurements(first_pass.stderr)
-    second_filter = (
-        f"loudnorm={common_filter}"
-        f":measured_I={measured['input_i']}"
-        f":measured_TP={measured['input_tp']}"
-        f":measured_LRA={measured['input_lra']}"
-        f":measured_thresh={measured['input_thresh']}"
-        f":offset={measured['target_offset']}"
-        ":linear=true:print_format=summary"
-    )
-    codec_args = _audio_codec_args_for_output(output_path, m4a_codec=m4a_codec)
+    return _parse_ebur128_summary(result.stderr)
+
+
+def _encode_audio(
+    input_path: Path,
+    output_path: Path,
+    ffmpeg_path: Path,
+    sample_rate: int,
+    audio_filter: str,
+) -> None:
     _run_ffmpeg(
         [
             str(ffmpeg_path),
@@ -616,20 +557,69 @@ def normalize_loudness(
             "-sn",
             "-dn",
             "-af",
-            second_filter,
+            audio_filter,
             "-ar",
             str(sample_rate),
-            *codec_args,
+            *_audio_codec_args_for_output(output_path),
             str(output_path),
         ]
     )
 
 
-def _quality_message(report: QualityReport) -> str:
-    reasons = "、".join(report.reasons) if report.reasons else "未發現明確單一特徵"
-    return (
-        f"品質風險分數 {report.artifact_score:.1f}/100；{reasons}。"
-        "此結果是啟發式警示，請以實際試聽確認。"
+def normalize_loudness(
+    input_path: Path,
+    output_path: Path,
+    ffmpeg_path: Path,
+    sample_rate: int,
+    input_lufs: float,
+    input_peak_db: float,
+) -> bool:
+    gain_db = TARGET_LUFS - input_lufs
+    use_limiter = input_peak_db + gain_db > TRUE_PEAK_DB
+    ceiling_db = TRUE_PEAK_DB
+    previous = None
+    max_attempts = 6
+    for _ in range(max_attempts):
+        audio_filter = f"volume={gain_db:.8f}dB:precision=double"
+        if use_limiter:
+            ceiling = 10 ** (ceiling_db / 20.0)
+            audio_filter += (
+                f",aresample={sample_rate * 4}:osf=dbl"
+                f",alimiter=limit={ceiling:.8f}:attack=1:release=50"
+                ":level=0:level_in=1:level_out=1:latency=1"
+                f",aresample={sample_rate}:osf=dbl"
+            )
+        _encode_audio(input_path, output_path, ffmpeg_path, sample_rate, audio_filter)
+        output_lufs, output_peak_db = _measure_loudness(output_path, ffmpeg_path)
+        lufs_error = TARGET_LUFS - output_lufs
+        peak_ok = output_peak_db <= TRUE_PEAK_DB + 0.1
+        if TARGET_LUFS - 0.3 <= output_lufs <= TARGET_LUFS + 0.3 and peak_ok:
+            return use_limiter
+
+        if not use_limiter:
+            use_limiter = output_peak_db + lufs_error > TRUE_PEAK_DB + 0.1
+            gain_db += lufs_error
+            continue
+
+        # Relative to the ceiling, the previous render estimates how much extra gain survives limiting.
+        drive = gain_db - ceiling_db
+        relative_lufs = output_lufs - ceiling_db
+        slope = 1.0
+        if previous is not None:
+            previous_drive, previous_lufs = previous
+            drive_change = drive - previous_drive
+            if abs(drive_change) >= 0.1:
+                slope = min(1.0, max(0.25, (relative_lufs - previous_lufs) / drive_change))
+        previous = drive, relative_lufs
+        ceiling_change = 0.0
+        if not peak_ok:
+            next_ceiling_db = max(-24.0, ceiling_db - (output_peak_db - TRUE_PEAK_DB) - 0.05)
+            ceiling_change = next_ceiling_db - ceiling_db
+            ceiling_db = next_ceiling_db
+        gain_db += ceiling_change + (lufs_error - ceiling_change) / slope
+
+    raise ValueError(
+        f"試了 {max_attempts} 次，仍無法將音量調到目標並控制突發的大音量。"
     )
 
 
@@ -637,58 +627,27 @@ def process_file(
     input_path: Path,
     ffmpeg_path: Path,
     output_path: Optional[Path] = None,
-    quality_threshold: float = 65.0,
-    quality_action: str = "warn",
-    width: float = 0.35,
-    mono_bass_hz: float = 150.0,
-    seed: int = 42,
-    target_lufs: float = -14.0,
-    true_peak_db: float = -1.0,
     output_format: str = "same",
-    m4a_codec: str = "alac",
+    widen: bool = True,
+    confirm_quality: Optional[Callable[[], bool]] = None,
 ) -> ProcessResult:
     input_path = input_path.resolve()
     if output_path is None:
         if output_format == "same":
             target_suffix = input_path.suffix.lower()
-        elif output_format == "m4a":
-            target_suffix = ".m4a"
-        elif output_format == "wav":
-            target_suffix = ".wav"
-        elif output_format == "flac":
-            target_suffix = ".flac"
-        elif output_format.startswith("."):
-            target_suffix = output_format.lower()
         else:
-            target_suffix = f".{output_format.lower()}"
-        output_path = (input_path.with_name(input_path.stem + OUTPUT_SUFFIX + target_suffix)).resolve()
+            target_suffix = f".{output_format.lower().lstrip('.')}"
+        output_path = input_path.with_name(input_path.stem + OUTPUT_SUFFIX + target_suffix)
     else:
         output_path = output_path.resolve()
     print(f"\n[處理] {input_path.name}")
     audio, sample_rate = load_audio(input_path, ffmpeg_path)
-    print(f"  格式：{sample_rate} Hz / {audio.shape[0]} 聲道")
-
     report = analyze_quality(audio, sample_rate)
-    print(f"  分析：{_quality_message(report)}")
-    suspicious = report.artifact_score >= quality_threshold
-    if suspicious:
-        print("  [警告] 音檔音質不佳（可能存在水下聲或高頻劣化）")
-        if quality_action == "skip":
-            print("  [略過] 已依 --quality-action skip 停止此檔案的處理。")
-            return ProcessResult(input_path, None, report, False, True)
-
-    widened = is_effectively_mono(audio)
+    widened = widen and is_effectively_mono(audio)
     if widened:
         mono = np.mean(audio, axis=0, dtype=np.float64)
-        audio = widen_mono(mono, sample_rate, width, mono_bass_hz, seed)
-        print(f"  拓寬：已套用全通去相關（寬度 {width:.2f}，{mono_bass_hz:.0f} Hz 單聲道低頻）")
-    else:
-        print("  拓寬：原檔已有有效立體聲，保持原音場。")
+        audio = widen_mono(mono, sample_rate)
 
-    audio = apply_opto_compression(audio, sample_rate)
-    print("  壓縮：已套用 Opto 風格參數（3.5:1 / 10 ms / 650 ms）。")
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
     temporary_input: Optional[Path] = None
     temporary_output: Optional[Path] = None
     try:
@@ -697,21 +656,26 @@ def process_file(
         ) as handle:
             temporary_input = Path(handle.name)
         sf.write(str(temporary_input), audio.T, sample_rate, subtype="FLOAT")
+        input_lufs, input_peak_db = _measure_loudness(temporary_input, ffmpeg_path)
+        if report.artifact_score >= 65.0:
+            print("  這首歌的聲音可能不太清楚，建議先試聽。")
+            if confirm_quality is not None and not confirm_quality():
+                print("  [略過] 這首歌未另存新檔。")
+                return ProcessResult(input_path, None, report, False, True)
+        if widened:
+            print("  已將單聲道轉成立體聲。")
+        elif not widen:
+            print("  保留原有聲道。")
 
+        output_path.parent.mkdir(parents=True, exist_ok=True)
         with tempfile.NamedTemporaryFile(
             prefix=f".{output_path.stem}_", suffix=output_path.suffix, dir=str(output_path.parent), delete=False
         ) as handle:
             temporary_output = Path(handle.name)
         temporary_output.unlink(missing_ok=True)
 
-        normalize_loudness(
-            temporary_input,
-            temporary_output,
-            ffmpeg_path,
-            sample_rate,
-            target_lufs,
-            true_peak_db,
-            m4a_codec=m4a_codec,
+        limited = normalize_loudness(
+            temporary_input, temporary_output, ffmpeg_path, sample_rate, input_lufs, input_peak_db
         )
         os.replace(temporary_output, output_path)
         temporary_output = None
@@ -721,8 +685,8 @@ def process_file(
         if temporary_output is not None:
             temporary_output.unlink(missing_ok=True)
 
-    format_desc = _format_description(output_path, m4a_codec=m4a_codec)
-    print(f"  [完成] {output_path.name}（{target_lufs:g} LUFS / {true_peak_db:g} dBTP / {format_desc}）")
+    print("  已控制突然過大的聲音。" if limited else "  音量只做了整首一致的調整。")
+    print(f"  [完成] 已儲存 {output_path.name}")
     return ProcessResult(input_path, output_path, report, widened, False)
 
 
@@ -733,23 +697,26 @@ def _application_directory() -> Path:
 
 
 def discover_audio_files(paths: Iterable[str]) -> List[Path]:
-    raw_paths = list(paths)
-    candidates = [Path(path).expanduser() for path in raw_paths]
-    if not candidates:
-        candidates = [_application_directory()]
-
     discovered: List[Path] = []
-    for candidate in candidates:
-        if candidate.is_dir():
-            discovered.extend(
-                path
-                for path in sorted(candidate.iterdir())
-                if path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS
-            )
-        elif candidate.is_file() and candidate.suffix.lower() in SUPPORTED_EXTENSIONS:
-            discovered.append(candidate)
-        else:
-            print(f"[警告] 找不到或不支援：{candidate}")
+    for path_text in list(paths) or [str(_application_directory())]:
+        if not path_text:
+            print("已略過空白路徑。")
+            continue
+        try:
+            candidate = Path(path_text).expanduser()
+            if candidate.is_dir():
+                discovered.extend(
+                    path
+                    for path in sorted(candidate.iterdir())
+                    if path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS
+                )
+                continue
+            if candidate.is_file() and candidate.suffix.lower() in SUPPORTED_EXTENSIONS:
+                discovered.append(candidate)
+                continue
+        except (OSError, RuntimeError, ValueError):
+            pass
+        print(f"已略過 {path_text}（找不到、無法開啟或格式不支援）。")
 
     unique: List[Path] = []
     seen = set()
@@ -762,46 +729,13 @@ def discover_audio_files(paths: Iterable[str]) -> List[Path]:
     return unique
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="自動檢測伴奏品質、拓寬單聲道、平滑動態並正規化為直播用 WAV。"
-    )
-    parser.add_argument("paths", nargs="*", help="音檔或資料夾；省略時處理腳本所在資料夾。")
-    parser.add_argument("--ffmpeg", help="ffmpeg 執行檔路徑。")
-    parser.add_argument(
-        "--quality-action",
-        choices=("warn", "skip"),
-        default="warn",
-        help="品質疑慮時警告後繼續，或略過該檔（預設：warn）。",
-    )
-    parser.add_argument(
-        "--quality-threshold",
-        type=float,
-        default=65.0,
-        help="品質警告門檻 0–100，越低越敏感（預設：65）。",
-    )
-    parser.add_argument("--width", type=float, default=0.35, help="單聲道拓寬強度 0–1。")
-    parser.add_argument(
-        "--mono-bass-hz", type=float, default=150.0, help="Side 高通截止頻率（預設：150 Hz）。"
-    )
-    parser.add_argument("--seed", type=int, default=42, help="相位網路的可重現亂數種子。")
-    parser.add_argument("--target-lufs", type=float, default=-14.0, help="目標整體響度。")
-    parser.add_argument("--true-peak", type=float, default=-1.0, help="True Peak 上限 dBTP。")
-    parser.add_argument(
-        "--output-format",
-        "--format",
-        dest="output_format",
-        choices=("same", "wav", "m4a", "flac"),
-        default="same",
-        help="輸出音訊格式：same（預設，與輸入檔案格式相同且盡可能無損）、wav（24-bit WAV）、m4a（24-bit ALAC 無損 M4A）、flac（無損 FLAC）。",
-    )
-    parser.add_argument(
-        "--m4a-codec",
-        choices=("alac", "aac"),
-        default="alac",
-        help="M4A 輸出編碼：alac（預設，Apple Lossless 24-bit 無損，避免二次壓縮音質受損）或 aac（AAC 320k 高音質有損壓縮）。",
-    )
-    return parser
+def _parse_dragged_paths(text: str) -> List[str]:
+    paths = shlex.shlex(text, posix=True)
+    paths.whitespace_split = True
+    paths.quotes = '"'
+    paths.escape = ""
+    paths.commenters = ""
+    return list(paths)
 
 
 def _configure_windows_output() -> None:
@@ -816,56 +750,97 @@ def _configure_windows_output() -> None:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    _configure_windows_output()
-    args = build_parser().parse_args(argv)
-    if not 0.0 <= args.quality_threshold <= 100.0:
-        print("[錯誤] --quality-threshold 必須介於 0 與 100。")
-        return 2
-    if not 0.0 <= args.width <= 1.0:
-        print("[錯誤] --width 必須介於 0 與 1。")
-        return 2
+    interactive = sys.stdin is not None and sys.stdin.isatty()
 
-    files = discover_audio_files(args.paths)
-    if not files:
-        print("[錯誤] 找不到可處理的音檔。")
-        return 1
+    def ask(prompt: str, choices: Sequence[str] = (), default: str = "") -> str:
+        nonlocal interactive
+        while interactive:
+            try:
+                answer = input(prompt).strip()
+            except (EOFError, OSError):
+                interactive = False
+                break
+            if not answer:
+                return default
+            if not choices or answer in choices:
+                return answer
+            print("請輸入畫面上的其中一個選項，再按 Enter。")
+        return default
 
     try:
-        ffmpeg_path = find_ffmpeg(args.ffmpeg)
-    except FileNotFoundError as error:
-        print(f"[錯誤] {error}")
-        return 2
+        _configure_windows_output()
+        paths = list(sys.argv[1:] if argv is None else argv)
+        files = discover_audio_files(paths) if paths else []
+        if paths and not files and not interactive:
+            print("找不到可處理的音檔。")
+            return 1
+        while not files:
+            answer = ask("請把音檔或資料夾拖到這裡，再按 Enter。直接按 Enter 會使用程式所在的資料夾。\n> ")
+            try:
+                paths = _parse_dragged_paths(answer)
+            except ValueError:
+                print("讀不到這些路徑，請把檔案重新拖進來。")
+                continue
+            files = discover_audio_files(paths)
+            if not files:
+                print("找不到可處理的音檔。")
+                if not interactive:
+                    return 1
 
-    print(f"WAVNormalizer：找到 {len(files)} 個音檔")
-    print(f"ffmpeg：{ffmpeg_path}")
-    failures = 0
-    skipped = 0
-    for input_path in files:
+        print(f"找到 {len(files)} 首歌。")
+        widen = ask(
+            "要把單聲道歌曲轉成立體聲嗎？已有立體聲效果的歌曲會保留原有聲道。\n"
+            "1. 要（直接按 Enter）\n2. 不要\n> ",
+            ("1", "2"),
+            "1",
+        ) == "1"
+        formats = {"1": "same", "2": "wav", "3": "m4a", "4": "flac"}
+        format_choice = ask(
+            "要儲存成哪種格式？\n1. 和原檔相同（直接按 Enter）\n"
+            "2. WAV\n3. M4A（無損）\n4. FLAC\n> ",
+            tuple(formats),
+            "1",
+        )
+
+        def confirm_quality() -> bool:
+            return ask("要繼續處理這首歌嗎？\n1. 繼續（直接按 Enter）\n2. 略過\n> ", ("1", "2"), "1") == "1"
+
+        ffmpeg_path = find_ffmpeg()
+        completed = skipped = failures = 0
+        output_folders = set()
+        for path in files:
+            try:
+                result = process_file(
+                    path,
+                    ffmpeg_path,
+                    output_format=formats[format_choice],
+                    widen=widen,
+                    confirm_quality=confirm_quality,
+                )
+                if result.skipped:
+                    skipped += 1
+                elif result.output_path is not None:
+                    completed += 1
+                    output_folders.add(result.output_path.parent)
+            except subprocess.CalledProcessError:
+                failures += 1
+                print(f"  [失敗] {path.name} 無法讀取或儲存。請確認音檔能正常播放，且資料夾可寫入。")
+            except (OSError, RuntimeError, ValueError) as error:
+                failures += 1
+                print(f"  [失敗] {path.name}。{error}")
+
+        print(f"\n處理結束。完成 {completed} 首，略過 {skipped} 首，失敗 {failures} 首。")
+        for folder in sorted(output_folders):
+            print(f"新檔已儲存到 {folder}")
+        return 1 if failures else 0
+    except (Exception, KeyboardInterrupt) as error:
+        print(f"處理中斷。{error}")
+        return 1
+    finally:
         try:
-            result = process_file(
-                input_path=input_path,
-                ffmpeg_path=ffmpeg_path,
-                quality_threshold=args.quality_threshold,
-                quality_action=args.quality_action,
-                width=args.width,
-                mono_bass_hz=args.mono_bass_hz,
-                seed=args.seed,
-                target_lufs=args.target_lufs,
-                true_peak_db=args.true_peak,
-                output_format=args.output_format,
-                m4a_codec=args.m4a_codec,
-            )
-            skipped += int(result.skipped)
-        except (OSError, RuntimeError, ValueError, subprocess.CalledProcessError) as error:
-            failures += 1
-            print(f"  [失敗] {input_path.name}：{error}")
-            if isinstance(error, subprocess.CalledProcessError) and error.stderr:
-                tail = "\n".join(error.stderr.strip().splitlines()[-8:])
-                print(tail)
-
-    completed = len(files) - failures - skipped
-    print(f"\n批次結束：完成 {completed}、略過 {skipped}、失敗 {failures}")
-    return 1 if failures else 0
+            ask("按 Enter 關閉視窗。")
+        except KeyboardInterrupt:
+            pass
 
 
 if __name__ == "__main__":

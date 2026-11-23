@@ -1,0 +1,117 @@
+name: Build and release Windows exe
+
+'on':
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-release
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.14'
+          cache: pip
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt pytest
+      - name: Run tests
+        run: python -m pytest -q
+      - name: Build executable
+        run: python build_exe.py
+      - name: Smoke-test executable
+        timeout-minutes: 5
+        shell: pwsh
+        run: |
+          @'
+          import math
+          from pathlib import Path
+          import struct
+          import subprocess
+          import tempfile
+          import wave
+
+          executable = Path('dist/WAVNormalizer.exe').resolve(strict=True)
+          with tempfile.TemporaryDirectory(prefix='音訊 測試 ') as directory:
+              source = Path(directory) / '試聽.wav'
+              rate = 48000
+              with wave.open(str(source), 'wb') as audio:
+                  audio.setparams((1, 2, rate, 0, 'NONE', 'not compressed'))
+                  samples = (int(8000 * math.sin(math.tau * 440 * i / rate)) for i in range(rate))
+                  audio.writeframes(struct.pack(f'<{rate}h', *samples))
+
+              subprocess.run([str(executable), str(source)], stdin=subprocess.DEVNULL,
+                             timeout=120, check=True)
+              output = source.with_name(f'{source.stem}_enhanced.wav')
+              if not output.is_file() or not output.stat().st_size:
+                  raise SystemExit(f'Missing or empty smoke-test output: {output}')
+          '@ | python -X utf8 -
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows-exe
+          path: dist/WAVNormalizer.exe
+          if-no-files-found: error
+          retention-days: 7
+          overwrite: true
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/download-artifact@v8
+        with:
+          name: windows-exe
+          path: release
+      - name: Publish executable
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          git fetch --tags origin
+          versions=$(git tag --list |
+            awk '/^v[0-9]+\.[0-9]+\.[0-9]+$/ { print substr($0, 2) }' |
+            LC_ALL=C sort -t. -k1,1nr -k2,2nr -k3,3nr)
+
+          tag=
+          while IFS= read -r version; do
+            [[ -n "$version" ]] || continue
+            candidate="v$version"
+            commit=$(git rev-parse --verify "refs/tags/${candidate}^{}")
+            if [[ "$commit" == "$GITHUB_SHA" ]]; then
+              tag=$candidate
+              break
+            fi
+          done <<< "$versions"
+
+          asset=release/WAVNormalizer.exe
+          test -s "$asset"
+          if [[ -n "$tag" ]]; then
+            releases=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" --jq '.[].tag_name')
+            if grep -Fxq -- "$tag" <<< "$releases"; then
+              gh release upload "$tag" "$asset" --repo "$GITHUB_REPOSITORY" --clobber
+              exit 0
+            fi
+          else
+            IFS=. read -r major minor patch <<< "${versions%%$'\n'*}"
+            tag="v${major:-0}.${minor:-0}.$((10#${patch:-0} + 1))"
+          fi
+
+          gh release create "$tag" "$asset" --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" --title "WAVnormalize_$tag" --generate-notes --latest
